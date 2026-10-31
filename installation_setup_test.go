@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -194,5 +195,51 @@ func TestSetupCancellationStopsAnInFlightCall(t *testing.T) {
 	})
 	if answer := install(s, stepRequest(stepCredential)); answer.Code != http.StatusNoContent {
 		t.Fatalf("cancellation: %d %s", answer.Code, answer.Body)
+	}
+}
+
+// A slow host response must not extend the callback's ability to issue setup.
+type blockedInstallWriter struct {
+	header  http.Header
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (w *blockedInstallWriter) Header() http.Header         { return w.header }
+func (w *blockedInstallWriter) WriteHeader(int)             { close(w.entered); <-w.release }
+func (w *blockedInstallWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+func TestSetupExpiresBeforeResponseIsWritten(t *testing.T) {
+	module := &relayedModule{}
+	var saved Installation
+	s, stand := setupReceiver(t, module, func(_ context.Context, i Installation) error {
+		saved = i
+		return nil
+	})
+	w := &blockedInstallWriter{header: make(http.Header), entered: make(chan struct{}), release: make(chan struct{})}
+	done := make(chan struct{})
+	go func() { defer close(done); s.handleInstallation(w, stepRequest(stepCredential)) }()
+	<-w.entered
+	if err := saved.Call(context.Background(), "things", searchName, thingMessage("GetThingRequest"), thingMessage("Thing")); err == nil {
+		t.Error("setup remained usable after callback returned")
+	}
+	if len(stand.asked()) != 0 || len(module.observed()) != 0 {
+		t.Error("expired handle issued or dispatched")
+	}
+	close(w.release)
+	<-done
+}
+
+func TestInstallationDoesNotExposeCredentialAsReflectableData(t *testing.T) {
+	module := &relayedModule{}
+	s, _ := setupReceiver(t, module, func(_ context.Context, i Installation) error {
+		v := reflect.ValueOf(i).FieldByName("setup")
+		if v.Kind() != reflect.Func {
+			return fmt.Errorf("setup contains inspectable state: %v", v.Kind())
+		}
+		return nil
+	})
+	if answer := install(s, stepRequest(stepCredential)); answer.Code != http.StatusNoContent {
+		t.Fatalf("install: %d", answer.Code)
 	}
 }

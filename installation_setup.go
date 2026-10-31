@@ -17,12 +17,6 @@ type SetupModule struct {
 	Methods   []string
 }
 
-type installationSetup struct {
-	ctx    context.Context
-	server *Server
-	token  string
-}
-
 // Call invokes a declared setup method for this verified pending attempt. The
 // authority issues a fresh, method-confined capability for every call. A retained
 // Installation cannot call after its callback has returned.
@@ -30,44 +24,51 @@ func (i Installation) Call(ctx context.Context, as, method string, request, resp
 	if i.setup == nil {
 		return fmt.Errorf("no verified installation attempt")
 	}
-	a := i.setup
-	if err := a.ctx.Err(); err != nil {
-		return err
-	}
-	declared := false
-	for _, module := range a.server.setupModules {
-		if module.As != as {
-			continue
+	return i.setup(ctx, as, method, request, response)
+}
+
+// setupCaller closes over credential-bearing state rather than placing it in
+// the Installation value visible to callback code.
+func (s *Server) setupCaller(attempt context.Context, token string) func(context.Context, string, string, proto.Message, proto.Message) error {
+	return func(ctx context.Context, as, method string, request, response proto.Message) error {
+		if err := attempt.Err(); err != nil {
+			return err
 		}
-		for _, allowed := range module.Methods {
-			if allowed == method {
-				declared = true
+		declared := false
+		for _, module := range s.setupModules {
+			if module.As != as {
+				continue
+			}
+			for _, allowed := range module.Methods {
+				if allowed == method {
+					declared = true
+				}
 			}
 		}
+		if !declared {
+			return fmt.Errorf("setup method %q is not declared for %q", method, as)
+		}
+		relay := s.setupRelays[as]
+		if relay == nil {
+			return fmt.Errorf("setup module %q is not connected", as)
+		}
+		md, err := methodDescriptor(method)
+		if err != nil {
+			return err
+		}
+		if request == nil || response == nil || !request.ProtoReflect().IsValid() || !response.ProtoReflect().IsValid() || request.ProtoReflect().Descriptor().FullName() != md.Input().FullName() || response.ProtoReflect().Descriptor().FullName() != md.Output().FullName() {
+			return fmt.Errorf("setup method %q requires its declared request and response types", method)
+		}
+		callCtx, cancel := context.WithCancel(ctx)
+		stop := context.AfterFunc(attempt, cancel)
+		defer stop()
+		defer cancel()
+		issued, err := s.host.outbound.IssueForInstallationSetup(callCtx, token, relay.binding, method)
+		if err != nil {
+			return err
+		}
+		return relay.conn.Invoke(issued.Carry(callCtx), method, request, response)
 	}
-	if !declared {
-		return fmt.Errorf("setup method %q is not declared for %q", method, as)
-	}
-	relay := a.server.setupRelays[as]
-	if relay == nil {
-		return fmt.Errorf("setup module %q is not connected", as)
-	}
-	md, err := methodDescriptor(method)
-	if err != nil {
-		return err
-	}
-	if request == nil || response == nil || !request.ProtoReflect().IsValid() || !response.ProtoReflect().IsValid() || request.ProtoReflect().Descriptor().FullName() != md.Input().FullName() || response.ProtoReflect().Descriptor().FullName() != md.Output().FullName() {
-		return fmt.Errorf("setup method %q requires its declared request and response types", method)
-	}
-	callCtx, cancel := context.WithCancel(ctx)
-	stop := context.AfterFunc(a.ctx, cancel)
-	defer stop()
-	defer cancel()
-	issued, err := a.server.host.outbound.IssueForInstallationSetup(callCtx, a.token, relay.binding, method)
-	if err != nil {
-		return err
-	}
-	return relay.conn.Invoke(issued.Carry(callCtx), method, request, response)
 }
 
 func (s *Server) openSetupRelays(lookup func(string, string) (string, error)) (map[string]*moduleRelay, error) {

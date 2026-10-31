@@ -15,6 +15,7 @@ import (
 	"github.com/codefly-dev/sdk-go/workcontext"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 // The install step. The host records an installation pending, and its
@@ -45,7 +46,7 @@ type Installation struct {
 	// whose intent, delivered generation and digest the authority checks. A
 	// host retry of the same attempt carries the same operation.
 	OperationID string
-	setup       *installationSetup
+	setup       func(context.Context, string, string, proto.Message, proto.Message) error
 }
 
 // ErrInstallRefused marks an intentional install refusal. Use RefuseInstall
@@ -122,10 +123,7 @@ func (s *Server) handleInstallation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	installation.OperationID = verified.GetTaskId()
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
-	installation.setup = &installationSetup{ctx: ctx, server: s, token: tokens[0]}
-	s.installOnce(ctx, installation).write(w)
+	s.installOnce(r.Context(), installation, tokens[0]).write(w)
 }
 
 // decodeInstallation bounds the entire body, including whitespace after the
@@ -251,7 +249,7 @@ const (
 )
 
 // installOnce is entered only after the authority verified this very attempt.
-func (s *Server) installOnce(ctx context.Context, installation Installation) installationOutcome {
+func (s *Server) installOnce(ctx context.Context, installation Installation, token string) installationOutcome {
 	key := installationKey{id: installation.ID, revision: installation.Revision, operation: installation.OperationID}
 	s.installMu.Lock()
 	if previous := s.installations[key]; previous != nil {
@@ -276,7 +274,7 @@ func (s *Server) installOnce(ctx context.Context, installation Installation) ins
 
 	// The channel publishes the immutable outcome to all waiters. A panicking
 	// step is recorded as a failure too, so no duplicate waits forever.
-	result.installationOutcome = s.runInstall(ctx, installation)
+	result.installationOutcome = s.runInstall(ctx, installation, token)
 	s.installMu.Lock()
 	if result.status != http.StatusNoContent {
 		delete(s.installations, key)
@@ -292,7 +290,7 @@ func (s *Server) installOnce(ctx context.Context, installation Installation) ins
 	return result.installationOutcome
 }
 
-func (s *Server) runInstall(ctx context.Context, installation Installation) (outcome installationOutcome) {
+func (s *Server) runInstall(ctx context.Context, installation Installation, token string) (outcome installationOutcome) {
 	outcome.status = http.StatusServiceUnavailable
 	defer func() {
 		if recover() != nil {
@@ -302,7 +300,13 @@ func (s *Server) runInstall(ctx context.Context, installation Installation) (out
 	if s.installStep == nil {
 		return installationOutcome{status: http.StatusConflict, reason: "this solution declares no install step"}
 	}
-	err := s.installStep(ctx, installation)
+	// Close the setup handle before recording the outcome or writing a response.
+	err := func() error {
+		attempt, cancel := context.WithCancel(ctx)
+		defer cancel()
+		installation.setup = s.setupCaller(attempt, token)
+		return s.installStep(attempt, installation)
+	}()
 	if err == nil {
 		return installationOutcome{status: http.StatusNoContent}
 	}
